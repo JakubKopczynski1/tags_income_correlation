@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-from mappings import duplicated_titles, keywords_no_colon, tracks_titles_gema
+from mappings import duplicated_titles_gema, keywords_no_colon, tracks_titles_rework_gema, tracks_to_drop
 
 pd.set_option('display.max_columns', 200)
 pd.set_option('display.width', 1000)
@@ -89,10 +89,13 @@ gema_APL['helper_column'] = (gema_APL['track_title'].astype(str)
                           + gema_APL['publisher_name']
                             )
 
-gema_APL['mapped_helper'] = gema_APL['helper_column'].map(duplicated_titles)
+# Drop tracks that are not our or no longer represented
+gema_APL = gema_APL[~gema_APL['helper_column'].isin(tracks_to_drop)]
+
+# Mapping duplicated track titles
+gema_APL['mapped_helper'] = gema_APL['helper_column'].map(duplicated_titles_gema)
 
 gema_APL['track_title'] = gema_APL['mapped_helper'].fillna(gema_APL['track_title'])
-
 
 # Group and sum income per track title
 grouped_income_APL = (gema_APL.groupby('track_title', as_index=False)['income']
@@ -109,6 +112,7 @@ folder_path_met = "C:/Users/jakub/PycharmProjects/tags_income_correlation/cadenz
 
 # Target columns
 target_columns_met = [
+    'ALBUM: Release Date',
     'TRACK: Title',
     'TRACK: Is Main',
     'WRITER:1: Last Name',
@@ -152,6 +156,7 @@ metadata = metadata.drop("TRACK: Is Main", axis=1)
 
 # Renaming columns
 metadata = metadata.rename(columns={
+    'ALBUM: Release Date': 'release_date',
     'TRACK: Title': 'track_title',
     'WRITER:1: Last Name': 'writer_last_name',
     'PUBLISHER:1: Name': 'publisher_name'
@@ -160,9 +165,10 @@ metadata = metadata.rename(columns={
 metadata['track_title'] = metadata['track_title'].str.upper()
 metadata['writer_last_name'] = metadata['writer_last_name'].str.upper()
 metadata['publisher_name'] = metadata['publisher_name'].str.upper()
+metadata['release_date'] = pd.to_datetime(metadata['release_date'])
 
 # Adjusting titles registered in GEMA without apostrophes and/or parentheses, and also those registered differently
-metadata['track_title'] = metadata['track_title'].replace(tracks_titles_gema)
+metadata['track_title'] = metadata['track_title'].replace(tracks_titles_rework_gema)
 
 # Rename the publishers
 metadata['publisher_name'] = metadata['publisher_name'].replace(rename_dict_publishers)
@@ -246,15 +252,26 @@ mask = metadata['track_title'].duplicated(keep=False)
 
 metadata.loc[mask, 'track_title'] = metadata.loc[mask, 'helper_column']
 
-################################
-### MAPPING INCOME WITH TAGS ###
-################################
+##########################################
+### MAPPING INCOME WITH TAGS AND DATES ###
+##########################################
 
 helper_dict = metadata.set_index('helper_column')['all_tags'].to_dict()
 title_dict = metadata.set_index('track_title')['all_tags'].to_dict()
 
-# Mapping with helper_column first, the with track_title column
+helper_dict_date = metadata.set_index('helper_column')['release_date'].to_dict()
+title_dict_date = metadata.set_index('track_title')['release_date'].to_dict()
+
+# Mapping tags and dates with helper_column first, the with track_title column
 grouped_income_APL['all_tags'] = (grouped_income_APL['track_title'].map(helper_dict).fillna(grouped_income_APL['track_title'].map(title_dict)))
+grouped_income_APL['release_date'] = (grouped_income_APL['track_title'].map(helper_dict_date).fillna(grouped_income_APL['track_title'].map(title_dict_date)))
+
+# Obliczamy wiek utworu w dniach względem końca Twojego okresu raportowego (np. koniec 2025)
+reference_date = pd.to_datetime('2025-12-31')
+grouped_income_APL['track_age_days'] = (reference_date - grouped_income_APL['release_date']).dt.days
+
+# Jeśli masz utwory z przyszłości (błędy w dacie), ustawiamy im minimum 0 dni
+grouped_income_APL['track_age_days'] = grouped_income_APL['track_age_days'].clip(lower=0)
 
 grouped_income_APL = grouped_income_APL.dropna(subset=['all_tags'])
 
@@ -291,23 +308,32 @@ tags_to_remove = [
 
 tags_df = tags_df.drop(columns=tags_to_remove, errors='ignore')
 
-# Join this back to your income column
-analysis_df = pd.concat([grouped_income_APL['income'], tags_df], axis=1)
+# Zmieniamy pd.concat, aby dołączyć wiek utworu obok income
+analysis_df = pd.concat([grouped_income_APL[['income', 'track_age_days']], tags_df], axis=1)
 
 ##############################
 ### FILTERING OUT OUTLIERS ###
 ##############################
 
-# Calculate the 99.9th percentile threshold
-threshold = analysis_df['income'].quantile(0.999)
-print(f"99.9th Percentile Threshold: ${threshold:.2f}")
+# Definiujemy dolny próg (np. $1)
+lower_threshold = 1.00
 
-# Create the filtered DataFrame (excluding the top 1%)
-df_clean = analysis_df[analysis_df['income'] <= threshold].copy()
+# Obliczamy górny próg (99. percentyl)
+upper_threshold = analysis_df['income'].quantile(0.99)
 
-# Optional: See how many tracks were removed
-removed_count = len(analysis_df) - len(df_clean)
-print(f"Removed {removed_count} outlier tracks.")
+print(f"Zakres analizy: od ${lower_threshold:.2f} do ${upper_threshold:.2f}")
+
+df_clean = analysis_df[
+    (analysis_df['income'] >= lower_threshold) &
+    (analysis_df['income'] <= upper_threshold)
+].copy()
+
+removed_low = len(analysis_df[analysis_df['income'] < lower_threshold])
+removed_high = len(analysis_df[analysis_df['income'] > upper_threshold])
+
+print(f"Usunięto {removed_low} utworów poniżej progu $1 (tzw. 'dust').")
+print(f"Usunięto {removed_high} utworów powyżej 99. percentyla (outliery).")
+print(f"Pozostało do analizy: {len(df_clean)} utworów.")
 
 ##############################################
 ### CALCULATING POINT-BISERIAL CORRELATION ###
@@ -318,9 +344,6 @@ correlations = df_clean.corr()['income'].sort_values(ascending=False)
 
 # Remove the 'income' correlation with itself
 tag_correlations = correlations.drop('income')
-
-print(tag_correlations.head(20)) # Top positive earners
-print(tag_correlations.tail(20)) # Top negative earners (tags associated with low income)
 
 ############################
 ### THE FREQUENCY FILTER ###
@@ -337,8 +360,8 @@ normal_tags = tag_counts[(tag_counts > 50) & (tag_counts < upper_threshold)].ind
 # Re-run correlation only on common tags
 filtered_correlations = df_clean[['income'] + list(normal_tags)].corr()['income'].drop('income').sort_values(ascending=False)
 
-print(filtered_correlations.head(20)) # Top positive earners
-print(filtered_correlations.tail(20)) # Top negative earners (tags associated with low income)
+print('TOP POSITIVE EARNERS:\n', filtered_correlations.head(20))
+print('\nTOP NEGATIVE EARNERS:\n', filtered_correlations.tail(20))
 
 ##########################
 ### MEAN INCOME BY TAG ###
@@ -350,7 +373,7 @@ for tag in normal_tags:
     mean_income_by_tag[tag] = df_clean[df_clean[tag] == 1]['income'].mean()
 
 mean_income_by_tag = pd.Series(mean_income_by_tag).sort_values(ascending=False)
-print('MEAN INCOME BY TAG:\n', mean_income_by_tag.head(20))
+print('\nMEAN INCOME BY TAG:\n', mean_income_by_tag.head(20))
 
 ######################################
 ### TOP TAG STATISTICAL VALIDATION ###
@@ -358,14 +381,16 @@ print('MEAN INCOME BY TAG:\n', mean_income_by_tag.head(20))
 
 from scipy.stats import pointbiserialr
 
+p_keyword = 'Neutral'
+
 # Check a specific tag
-tag_column = df_clean['News']
+tag_column = df_clean[p_keyword]
 income_column = df_clean['income']
 
 correlation, p_value = pointbiserialr(tag_column, income_column)
 
-print(f"Correlation: {correlation:.4f}")
-print(f"P-value: {p_value:.10f}")
+print(f'\nCorrelation for the keyword {p_keyword}: {correlation:.4f}')
+print(f'P-value: {p_value:.10f}\n')
 
 #####################
 ### VISUALIZATION ###
@@ -382,13 +407,162 @@ plt.figure(figsize=(10,8))
 
 plot_data.sort_values().plot(kind='barh')
 
-plt.title("Top and Bottom 10 Correlations between Tags and Income (GEMA)")
-plt.xlabel("Correlation with Income")
+plt.title('Top and Bottom 10 Correlations between Tags and Income (GEMA 2024-2025)')
+plt.xlabel('Correlation with Income')
 
 plt.axvline(0)  # linia zero
 plt.tight_layout()
 
-plt.show()
+################################################
+### COMPARING WITH SPEARMAN RANK CORRELATION ###
+################################################
 
-# Można jeszcze porównać z korelacją nieparametryczną Spearmana
-# Można jeszcze spróbować z modelem regresji Lasso / ElasticNet
+# Define the columns to analyze (income + your filtered normal_tags)
+cols_to_analyze = ['income'] + list(normal_tags)
+
+# Calculate Pearson Correlation (Point-Biserial)
+pearson_corrs = df_clean[cols_to_analyze].corr(method='pearson')['income'].drop('income')
+
+# Calculate Spearman Correlation (Rank-based)
+spearman_corrs = df_clean[cols_to_analyze].corr(method='spearman')['income'].drop('income')
+
+# Create a comparison DataFrame
+comparison_df = pd.DataFrame({
+    'Pearson': pearson_corrs,
+    'Spearman': spearman_corrs,
+    'Frequency': tag_counts[normal_tags]  # Adding frequency for context
+})
+
+# Add a 'Difference' column to see which tags shift the most
+comparison_df['Diff'] = comparison_df['Spearman'] - comparison_df['Pearson']
+
+# Show the top results sorted by Spearman
+print('CORRELATION COMPARISON (Sorted by Spearman):')
+print(comparison_df.sort_values(by='Spearman', ascending=False).head(20))
+
+########################
+### LASSO REGRESSION ###
+########################
+
+# Które tagi mają wpływ na income biorąc pod uwagę też inne tagi?
+
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LassoCV
+from sklearn.metrics import r2_score
+
+X = df_clean.drop(columns='income')
+y = df_clean['income']
+
+# Train-test split (opcjonalny, ale zalecany)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+# Log transform
+y_train_log = np.log1p(y_train)
+y_test_log = np.log1p(y_test)
+
+# Standardyzacja
+scaler = StandardScaler()
+
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# Lasso z cross-validation
+lasso = LassoCV(cv=5, random_state=42, n_jobs=-1, max_iter=10000)
+
+lasso.fit(X_train_scaled, y_train_log)
+
+# Wyniki
+coefficients = pd.Series(lasso.coef_, index=X.columns)
+
+# Usunięcie zer (usunięcie szumu)
+important_tags = coefficients[coefficients != 0].sort_values(ascending=False)
+
+print('\nTOP POSITIVE TAGS LASSO:')
+print(important_tags.head(15))
+
+print('\nTOP NEGATIVE TAGS LASSO:')
+print(important_tags.tail(15))
+
+# Ocena modelu
+y_pred = lasso.predict(X_test_scaled)
+
+print('\nWspółczynnik R^2 (Lasso):', r2_score(y_test_log, y_pred))
+
+###########################
+### LASSO VISUALIZATION ###
+###########################
+
+import seaborn as sns
+
+# Usuwamy track_age_days TYLKO z wyników do wykresu
+# Używamy .drop(..., errors='ignore'), aby kod się nie wywalił, jeśli go tam nie ma
+plot_tags = important_tags.drop(labels=['track_age_days'], errors='ignore')
+
+# Prepare the data (Top 10 positive and Top 10 negative)
+top_pos = plot_tags.head(10)
+top_neg = plot_tags.tail(10)
+plot_data = pd.concat([top_pos, top_neg])
+
+fig, ax = plt.subplots(figsize=(15, 8))
+
+sns.barplot(x=plot_data.values, y=plot_data.index, hue=plot_data.index, palette='viridis', legend=False, ax=ax)
+
+ax.set_title('Lasso Regression: Independent Impact of Tags on Income', fontsize=16, pad=20)
+ax.set_xlabel('Coefficient Strength', fontsize=12)
+ax.set_ylabel(None)
+ax.axvline(0, color='black', linewidth=1.5, alpha=0.7)
+ax.grid(axis='x', linestyle='--', alpha=0.4)
+
+for i, v in enumerate(plot_data.values):
+    if v > 0:
+        ax.text(v + 0.002, i, f' {v:.4f}',
+                va='center', ha='left', fontsize=10, fontweight='bold')
+    else:
+        ax.text(v - 0.002, i, f'{v:.4f} ',
+                va='center', ha='right', fontsize=10, fontweight='bold')
+
+plt.tight_layout()
+plt.show()
+# plt.savefig('lasso_important_tags.png')
+
+###############################
+### RANDOM FOREST REGRESSOR ###
+###############################
+
+from sklearn.ensemble import RandomForestRegressor
+
+X_forest = df_clean.drop(columns='income')
+y_forest = df_clean['income']
+
+# Log transform dla dochodu (nadal zalecany, by wyrównać rozkład)
+y_forest_log = np.log1p(y_forest)
+
+X_forest_train, X_forest_test, y_forest_train, y_forest_test = train_test_split(
+    X_forest, y_forest_log, test_size=0.2, random_state=42)
+
+rf = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1)
+
+rf.fit(X_forest_train, y_forest_train)
+
+y_forest_pred = rf.predict(X_forest_test)
+r2 = r2_score(y_forest_test, y_forest_pred)
+
+print(f'\nWspółczynnik R^2 (Random Forest): {r2:.4f}')
+
+# Feature Importance
+# To odpowiednik 'coefficients' z Lasso, ale pokazuje realny wpływ na decyzje modelu
+importances = pd.Series(rf.feature_importances_, index=X.columns)
+important_features = importances.sort_values(ascending=False)
+
+print('\nTOP 15 NAJWAŻNIEJSZYCH TAGÓW (RF):')
+print(important_features.head(15))
+
+# ElasticNet?
+# Można policzyć różnicę średnich jak jest tag (1) vs jak go nie ma (0)
+# Może dodać jako feature, z jakiego roku to jest przychód (Nutzungsjahr w statementach GEMY)?
+# Test U Manna-Whitney'a?
+# Trzeba jeszcze uzupełnić listę tytułów tracków
