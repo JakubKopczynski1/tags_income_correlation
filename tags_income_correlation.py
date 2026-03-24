@@ -335,19 +335,9 @@ print(f"Usunięto {removed_low} utworów poniżej progu $1 (tzw. 'dust').")
 print(f"Usunięto {removed_high} utworów powyżej 99. percentyla (outliery).")
 print(f"Pozostało do analizy: {len(df_clean)} utworów.")
 
-##############################################
-### CALCULATING POINT-BISERIAL CORRELATION ###
-##############################################
-
-# Calculate correlation of all columns with 'income'
-correlations = df_clean.corr()['income'].sort_values(ascending=False)
-
-# Remove the 'income' correlation with itself
-tag_correlations = correlations.drop('income')
-
-############################
-### THE FREQUENCY FILTER ###
-############################
+#########################################################
+### THE FREQUENCY FILTER & POINT-BISERIAL CORRELATION ###
+#########################################################
 
 # Get the sum of each tag column to see how often they appear
 tag_counts = df_clean.drop(columns='income').sum()
@@ -357,7 +347,7 @@ upper_threshold = len(df_clean) * 0.7
 
 normal_tags = tag_counts[(tag_counts > 50) & (tag_counts < upper_threshold)].index
 
-# Re-run correlation only on common tags
+# Run correlation only on common tags
 filtered_correlations = df_clean[['income'] + list(normal_tags)].corr()['income'].drop('income').sort_values(ascending=False)
 
 print('TOP POSITIVE EARNERS:\n', filtered_correlations.head(20))
@@ -392,27 +382,6 @@ correlation, p_value = pointbiserialr(tag_column, income_column)
 print(f'\nCorrelation for the keyword {p_keyword}: {correlation:.4f}')
 print(f'P-value: {p_value:.10f}\n')
 
-#####################
-### VISUALIZATION ###
-#####################
-
-import matplotlib.pyplot as plt
-
-top = filtered_correlations.head(10)
-bottom = filtered_correlations.tail(10)
-
-plot_data = pd.concat([top, bottom])
-
-plt.figure(figsize=(10,8))
-
-plot_data.sort_values().plot(kind='barh')
-
-plt.title('Top and Bottom 10 Correlations between Tags and Income (GEMA 2024-2025)')
-plt.xlabel('Correlation with Income')
-
-plt.axvline(0)  # linia zero
-plt.tight_layout()
-
 ################################################
 ### COMPARING WITH SPEARMAN RANK CORRELATION ###
 ################################################
@@ -421,10 +390,10 @@ plt.tight_layout()
 cols_to_analyze = ['income'] + list(normal_tags)
 
 # Calculate Pearson Correlation (Point-Biserial)
-pearson_corrs = df_clean[cols_to_analyze].corr(method='pearson')['income'].drop('income')
+pearson_corrs = df_clean[cols_to_analyze].corr(method='pearson')['income'].drop('income').sort_values(ascending=False)
 
 # Calculate Spearman Correlation (Rank-based)
-spearman_corrs = df_clean[cols_to_analyze].corr(method='spearman')['income'].drop('income')
+spearman_corrs = df_clean[cols_to_analyze].corr(method='spearman')['income'].drop('income').sort_values(ascending=False)
 
 # Create a comparison DataFrame
 comparison_df = pd.DataFrame({
@@ -437,22 +406,25 @@ comparison_df = pd.DataFrame({
 comparison_df['Diff'] = comparison_df['Spearman'] - comparison_df['Pearson']
 
 # Show the top results sorted by Spearman
-print('CORRELATION COMPARISON (Sorted by Spearman):')
-print(comparison_df.sort_values(by='Spearman', ascending=False).head(20))
+# print('CORRELATION COMPARISON (Sorted by Spearman):')
+# print(comparison_df.sort_values(by='Spearman', ascending=False).head(20))
 
-########################
-### LASSO REGRESSION ###
-########################
+###########################################################
+### LASSO REGRESSION WITH COLUMN TRANSFORMER & PIPELINE ###
+###########################################################
 
 # Które tagi mają wpływ na income biorąc pod uwagę też inne tagi?
 
 import numpy as np
 from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LassoCV
 from sklearn.metrics import r2_score
 
-X = df_clean.drop(columns='income')
+# Zachowanie wcześniejszego frequency filter
+X = df_clean[list(normal_tags) + ['track_age_days']]
 y = df_clean['income']
 
 # Train-test split (opcjonalny, ale zalecany)
@@ -464,39 +436,166 @@ X_train, X_test, y_train, y_test = train_test_split(
 y_train_log = np.log1p(y_train)
 y_test_log = np.log1p(y_test)
 
-# Standardyzacja
-scaler = StandardScaler()
+# Column Transformer Preprocessor
+binary_cols = list(normal_tags)
+numeric_cols = ['track_age_days']
 
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
+preprocessor = ColumnTransformer([
+    ('num', StandardScaler(), numeric_cols),
+    ('bin', 'passthrough', binary_cols)
+])
 
-# Lasso z cross-validation
-lasso = LassoCV(cv=5, random_state=42, n_jobs=-1, max_iter=10000)
+# Pipeline łączy kroki: najpierw skalowanie, potem Lasso
+lasso_pipeline = Pipeline([
+    ('prep', preprocessor),
+    ('lasso', LassoCV(cv=5, random_state=42, max_iter=10000))
+])
 
-lasso.fit(X_train_scaled, y_train_log)
+# Trenowanie
+# Ważne: Przekazujemy surowe X_train, pipeline sam zajmie się skalowaniem
+lasso_pipeline.fit(X_train, y_train_log)
 
-# Wyniki
-coefficients = pd.Series(lasso.coef_, index=X.columns)
+# Wyciąganie wyników - KLUCZOWY MOMENT
+# Pobieramy nazwy cech w kolejności, w jakiej ułożył je preprocesor
+feature_names = numeric_cols + binary_cols
+lasso_model = lasso_pipeline.named_steps['lasso']
+coefficients = pd.Series(lasso_model.coef_, index=feature_names)
 
-# Usunięcie zer (usunięcie szumu)
-important_tags = coefficients[coefficients != 0].sort_values(ascending=False)
+# Usuwamy wiek tracków do wykresu tagów
+important_tags = coefficients.drop('track_age_days', errors='ignore')
+important_tags = important_tags[important_tags != 0].sort_values(ascending=False)
 
-print('\nTOP POSITIVE TAGS LASSO:')
+print('\nTOP POSITIVE TAGS (Lasso Pipeline):')
 print(important_tags.head(15))
 
-print('\nTOP NEGATIVE TAGS LASSO:')
-print(important_tags.tail(15))
+# Ocena modelu
+# Pipeline automatycznie zeskaluje X_test przed predykcją!
+y_pred = lasso_pipeline.predict(X_test)
+
+print('\nWspółczynnik R^2 (Lasso Pipeline):', r2_score(y_test_log, y_pred))
+
+###################
+### ELASTIC NET ###
+###################
+
+from sklearn.linear_model import ElasticNetCV
+
+X_en = df_clean[list(normal_tags) + ['track_age_days']]
+y_en = df_clean['income']
+
+# Split and Log Transform
+X_en_train, X_en_test, y_en_train, y_en_test = train_test_split(
+    X_en, y_en, test_size=0.2, random_state=42
+)
+
+y_en_train_log = np.log1p(y_en_train)
+y_en_test_log = np.log1p(y_en_test)
+
+# Pipeline ze wcześniejszym Column Transformerem
+en_pipeline = Pipeline([
+    ('prep', preprocessor),
+    ('elasticnet', ElasticNetCV(
+        l1_ratio=[.1, .5, .7, .9, .95, .99, 1],
+        cv=5,
+        random_state=42,
+        max_iter=10000
+    ))
+])
+
+# Trenowanie
+# Ważne: Przekazujemy surowe X_train, pipeline sam zajmie się skalowaniem
+en_pipeline.fit(X_en_train, y_en_train_log)
+
+# Wyciąganie wyników
+# Pobieramy nazwy cech w kolejności, w jakiej ułożył je preprocesor
+en_model = en_pipeline.named_steps['elasticnet']
+coefficients_en = pd.Series(en_model.coef_, index=feature_names)
+
+# Usuwamy wiek tracków do wykresu tagów
+important_tags_en = coefficients_en.drop('track_age_days', errors='ignore')
+important_tags_en = important_tags_en[important_tags_en != 0].sort_values(ascending=False)
+
+print('\nTOP POSITIVE TAGS (Elastic Net Pipeline):')
+print(important_tags_en.head(15))
 
 # Ocena modelu
-y_pred = lasso.predict(X_test_scaled)
+# Pipeline automatycznie zeskaluje X_en_test przed predykcją!
+y_en_pred = en_pipeline.predict(X_en_test)
 
-print('\nWspółczynnik R^2 (Lasso):', r2_score(y_test_log, y_pred))
+print(f'Best L1 Ratio: {en_model.l1_ratio_}') # 1.0 means it behaved like Lasso
+print('\nWspółczynnik R^2 (Elastic Net Pipeline):', r2_score(y_en_test_log, y_en_pred))
 
-###########################
-### LASSO VISUALIZATION ###
-###########################
+#############################
+### BUSINESS IMPACT TABLE ###
+#############################
 
+# Pobieramy współczynniki z obu modeli (pobrane wcześniej z pipeline'ów)
+# Usuwamy wiek utworu, aby skupić się tylko na tagach
+df_lasso = pd.Series(lasso_pipeline.named_steps['lasso'].coef_, index=feature_names).drop('track_age_days', errors='ignore')
+df_en = pd.Series(en_pipeline.named_steps['elasticnet'].coef_, index=feature_names).drop('track_age_days', errors='ignore')
+
+# Tworzymy wspólną tabelę
+comparison_table = pd.DataFrame({
+    'Lasso_Coef': df_lasso,
+    'EN_Coef': df_en
+})
+
+# Filtrujemy - zostawiamy tylko te tagi, które chociaż w jednym modelu nie są zerem
+comparison_table = comparison_table[(comparison_table['Lasso_Coef'] != 0) | (comparison_table['EN_Coef'] != 0)]
+
+# Obliczamy Realny Wpływ Procentowy dla obu modeli
+comparison_table['Lasso_Impact_%'] = (np.exp(comparison_table['Lasso_Coef']) - 1) * 100
+comparison_table['EN_Impact_%'] = (np.exp(comparison_table['EN_Coef']) - 1) * 100
+
+# Dodajemy liczebność (Frequency) dla kontekstu biznesowego
+comparison_table['Frequency'] = tag_counts[comparison_table.index]
+
+# Sortujemy według średniego wpływu
+comparison_table['Mean_Impact'] = (comparison_table['Lasso_Impact_%'] + comparison_table['EN_Impact_%']) / 2
+comparison_table = comparison_table.sort_values(by='Mean_Impact', ascending=False)
+
+# Wyświetlamy Top 20 wyników
+# print("PORÓWNANIE WPŁYWU BIZNESOWEGO (LASSO VS ELASTIC NET):")
+# cols_to_show = ['Lasso_Impact_%', 'EN_Impact_%', 'Frequency']
+# print(comparison_table[cols_to_show].head(20).to_string(formatters={
+#     'Lasso_Impact_%': '{:,.2f}%'.format,
+#     'EN_Impact_%': '{:,.2f}%'.format
+# }))
+
+# comparison_table.to_csv('business_impact_table.csv')
+
+######################
+### VISUALIZATIONS ###
+######################
+
+import matplotlib.pyplot as plt
 import seaborn as sns
+
+fig, axs = plt.subplots(2, 2, figsize=(12, 12))
+
+# Subplot 1: Pearson Correlations
+top_corr = filtered_correlations.head(10)
+bottom_corr = filtered_correlations.tail(10)
+plot_data = pd.concat([top_corr, bottom_corr]).sort_values()
+
+axs[0,0].barh(y=plot_data.index, width=plot_data.values, color='skyblue')
+
+axs[0,0].set_title('Pearson Correlations')
+axs[0,0].axvline(0, color='black', linewidth=1)
+axs[0,0].grid(axis='x', linestyle='--', alpha=0.3)
+
+# Subplot 2: Spearman Correlations
+top_corr_sp = spearman_corrs.head(10)
+bottom_corr_sp = spearman_corrs.tail(10)
+plot_data_sp = pd.concat([top_corr_sp, bottom_corr_sp]).sort_values()
+
+axs[0,1].barh(y=plot_data_sp.index, width=plot_data_sp.values, color='orange')
+
+axs[0,1].set_title('Spearman Correlations')
+axs[0,1].axvline(0, color='black', linewidth=1)
+axs[0,1].grid(axis='x', linestyle='--', alpha=0.3)
+
+# Subplot 3: Lasso Regression
 
 # Usuwamy track_age_days TYLKO z wyników do wykresu
 # Używamy .drop(..., errors='ignore'), aby kod się nie wywalił, jeśli go tam nie ma
@@ -507,27 +606,34 @@ top_pos = plot_tags.head(10)
 top_neg = plot_tags.tail(10)
 plot_data = pd.concat([top_pos, top_neg])
 
-fig, ax = plt.subplots(figsize=(15, 8))
+sns.barplot(x=plot_data.values, y=plot_data.index, hue=plot_data.index, palette='viridis', legend=False, ax=axs[1,0])
 
-sns.barplot(x=plot_data.values, y=plot_data.index, hue=plot_data.index, palette='viridis', legend=False, ax=ax)
+axs[1,0].set_title('Lasso Regression')
+axs[1,0].set_ylabel(None)
+axs[1,0].axvline(0, color='black', linewidth=1.5, alpha=0.7)
+axs[1,0].grid(axis='x', linestyle='--', alpha=0.4)
 
-ax.set_title('Lasso Regression: Independent Impact of Tags on Income', fontsize=16, pad=20)
-ax.set_xlabel('Coefficient Strength', fontsize=12)
-ax.set_ylabel(None)
-ax.axvline(0, color='black', linewidth=1.5, alpha=0.7)
-ax.grid(axis='x', linestyle='--', alpha=0.4)
+# Subplot 4: Elastic Net
 
-for i, v in enumerate(plot_data.values):
-    if v > 0:
-        ax.text(v + 0.002, i, f' {v:.4f}',
-                va='center', ha='left', fontsize=10, fontweight='bold')
-    else:
-        ax.text(v - 0.002, i, f'{v:.4f} ',
-                va='center', ha='right', fontsize=10, fontweight='bold')
+# Usuwamy track_age_days TYLKO z wyników do wykresu
+# Używamy .drop(..., errors='ignore'), aby kod się nie wywalił, jeśli go tam nie ma
+plot_tags_en = important_tags_en.drop(labels=['track_age_days'], errors='ignore')
+
+# Prepare the data (Top 10 positive and Top 10 negative)
+top_pos_en = plot_tags_en.head(10)
+top_neg_en = plot_tags_en.tail(10)
+plot_data_en = pd.concat([top_pos_en, top_neg_en])
+
+sns.barplot(x=plot_data_en.values, y=plot_data_en.index, hue=plot_data_en.index, palette='viridis', legend=False, ax=axs[1,1])
+
+axs[1,1].set_title('Elastic Net')
+axs[1,1].set_ylabel(None)
+axs[1,1].axvline(0, color='black', linewidth=1.5, alpha=0.7)
+axs[1,1].grid(axis='x', linestyle='--', alpha=0.4)
 
 plt.tight_layout()
-plt.show()
-# plt.savefig('lasso_important_tags.png')
+# plt.show()
+plt.savefig('Subplots.png')
 
 ###############################
 ### RANDOM FOREST REGRESSOR ###
@@ -535,7 +641,7 @@ plt.show()
 
 from sklearn.ensemble import RandomForestRegressor
 
-X_forest = df_clean.drop(columns='income')
+X_forest = df_clean[list(normal_tags) + ['track_age_days']]
 y_forest = df_clean['income']
 
 # Log transform dla dochodu (nadal zalecany, by wyrównać rozkład)
@@ -544,7 +650,7 @@ y_forest_log = np.log1p(y_forest)
 X_forest_train, X_forest_test, y_forest_train, y_forest_test = train_test_split(
     X_forest, y_forest_log, test_size=0.2, random_state=42)
 
-rf = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1)
+rf = RandomForestRegressor(n_estimators=500, max_depth=None, min_samples_leaf=5, random_state=42, n_jobs=-1)
 
 rf.fit(X_forest_train, y_forest_train)
 
@@ -561,7 +667,11 @@ important_features = importances.sort_values(ascending=False)
 print('\nTOP 15 NAJWAŻNIEJSZYCH TAGÓW (RF):')
 print(important_features.head(15))
 
-# ElasticNet?
+# Pipeline dla Lasso
+# ColumnTransformer
+# Cross Validation Score
+# SHAP dla Random Forest
+# XGBoost
 # Można policzyć różnicę średnich jak jest tag (1) vs jak go nie ma (0)
 # Może dodać jako feature, z jakiego roku to jest przychód (Nutzungsjahr w statementach GEMY)?
 # Test U Manna-Whitney'a?
