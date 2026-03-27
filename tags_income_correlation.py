@@ -1,9 +1,11 @@
 import os
 import pandas as pd
-from mappings import duplicated_titles_gema, keywords_no_colon, tracks_titles_rework_gema, tracks_to_drop
+from mappings import tracks_to_drop, gema_to_apl, keywords_no_colon
 
 pd.set_option('display.max_columns', 200)
 pd.set_option('display.width', 1000)
+
+#################################################### PREPROCESSING #####################################################
 
 #################################
 ### GEMA INCOME PER APL TRACK ###
@@ -64,19 +66,18 @@ rename_dict_publishers = {
     'TRY A DANISH': 'SWIMMING POOL MUSIC'
 }
 
-# Rename the publishers
 gema['publisher_name'] = gema['publisher_name'].replace(rename_dict_publishers)
 
 # We will keep only our labels info
 gema_APL = gema.loc[gema['publisher_name'].isin(['APL DECADES',
-                                                           'APL FRONTRUNNERS',
-                                                           'APL LIFESTYLE',
-                                                           'APL ORGANIC',
-                                                           'APL PUBLISHING',
-                                                           'APL VOCALS',
-                                                           'CPH-NYC PUBLISHING APS',
-                                                           'SWIMMING POOL MUSIC'
-                                                           ])]
+                                                 'APL FRONTRUNNERS',
+                                                 'APL LIFESTYLE',
+                                                 'APL ORGANIC',
+                                                 'APL PUBLISHING',
+                                                 'APL VOCALS',
+                                                 'CPH-NYC PUBLISHING APS',
+                                                 'SWIMMING POOL MUSIC'
+                                                 ])]
 
 # Ensure Betrag gebucht is numeric
 gema_APL['income'] = pd.to_numeric(gema_APL['income'], errors='coerce')
@@ -89,13 +90,14 @@ gema_APL['helper_column'] = (gema_APL['track_title'].astype(str)
                           + gema_APL['publisher_name']
                             )
 
-# Drop tracks that are not our or no longer represented
+# Drop tracks that are not ours or no longer represented (TRACKS_TO_DROP)
 gema_APL = gema_APL[~gema_APL['helper_column'].isin(tracks_to_drop)]
 
-# Mapping duplicated track titles
-gema_APL['mapped_helper'] = gema_APL['helper_column'].map(duplicated_titles_gema)
+# Mapping duplicated titles and different naming of the same tracks
+gema_APL['gema_to_apl'] = gema_APL['helper_column'].map(gema_to_apl)
+gema_APL['track_title'] = gema_APL['gema_to_apl'].fillna(gema_APL['track_title'])
 
-gema_APL['track_title'] = gema_APL['mapped_helper'].fillna(gema_APL['track_title'])
+# gema_APL.to_csv('gema_APL.csv', index=False)
 
 # Group and sum income per track title
 grouped_income_APL = (gema_APL.groupby('track_title', as_index=False)['income']
@@ -168,7 +170,7 @@ metadata['publisher_name'] = metadata['publisher_name'].str.upper()
 metadata['release_date'] = pd.to_datetime(metadata['release_date'])
 
 # Adjusting titles registered in GEMA without apostrophes and/or parentheses, and also those registered differently
-metadata['track_title'] = metadata['track_title'].replace(tracks_titles_rework_gema)
+# metadata['track_title'] = metadata['track_title'].replace(apl_to_gema)
 
 # Rename the publishers
 metadata['publisher_name'] = metadata['publisher_name'].replace(rename_dict_publishers)
@@ -180,10 +182,8 @@ missing_publishers = {
     'SPARK OF JOY': 'APL PUBLISHING',
     'SUNBURST OF LOVE': 'APL PUBLISHING',
     'COOL ROQUE': 'SWIMMING POOL MUSIC'
-
 }
 
-# Filling in missing publishers
 metadata['publisher_name'] = metadata['publisher_name'].fillna(metadata['track_title'].map(missing_publishers))
 
 missing_composers = {
@@ -200,7 +200,6 @@ missing_composers = {
     'ZETUP': 'ZEKAJA'
 }
 
-# Filling in missing composers
 metadata['writer_last_name'] = metadata['writer_last_name'].fillna(metadata['track_title'].map(missing_composers))
 
 # Merging tags into one list for each track
@@ -235,10 +234,9 @@ def clean_keywords(tag_list):
         return list(cleaned)
     return tag_list
 
-# Apply the function directly to the list column
 metadata['all_tags'] = metadata['all_tags'].apply(clean_keywords)
 
-# Adding helper column
+# Adding helper column for matching with GEMA statements
 metadata['helper_column'] = (metadata['track_title'].astype(str)
                           + '_'
                           + metadata['writer_last_name'].astype(str)
@@ -248,9 +246,11 @@ metadata['helper_column'] = (metadata['track_title'].astype(str)
 
 metadata = metadata.drop_duplicates('helper_column')
 
+# Renaming duplicated track titles with values from helper column
 mask = metadata['track_title'].duplicated(keep=False)
-
 metadata.loc[mask, 'track_title'] = metadata.loc[mask, 'helper_column']
+
+# metadata.to_csv('metadata.csv', index=False)
 
 ##########################################
 ### MAPPING INCOME WITH TAGS AND DATES ###
@@ -262,26 +262,31 @@ title_dict = metadata.set_index('track_title')['all_tags'].to_dict()
 helper_dict_date = metadata.set_index('helper_column')['release_date'].to_dict()
 title_dict_date = metadata.set_index('track_title')['release_date'].to_dict()
 
-# Mapping tags and dates with helper_column first, the with track_title column
+# Mapping tags and dates with helper_column first, then with track_title column
 grouped_income_APL['all_tags'] = (grouped_income_APL['track_title'].map(helper_dict).fillna(grouped_income_APL['track_title'].map(title_dict)))
 grouped_income_APL['release_date'] = (grouped_income_APL['track_title'].map(helper_dict_date).fillna(grouped_income_APL['track_title'].map(title_dict_date)))
 
-# Obliczamy wiek utworu w dniach względem końca Twojego okresu raportowego (np. koniec 2025)
-reference_date = pd.to_datetime('2025-12-31')
+# Calculating tracks lifetime up to the given date
+# In case of errors in dates, the minimum value is set to 0 days
+reference_date = pd.to_datetime('2026-03-31')
 grouped_income_APL['track_age_days'] = (reference_date - grouped_income_APL['release_date']).dt.days
-
-# Jeśli masz utwory z przyszłości (błędy w dacie), ustawiamy im minimum 0 dni
 grouped_income_APL['track_age_days'] = grouped_income_APL['track_age_days'].clip(lower=0)
 
 grouped_income_APL = grouped_income_APL.dropna(subset=['all_tags'])
 
 # grouped_income_APL.to_csv('grouped_income_APL.csv', index=False)
 
-########################
-### ONE-HOT ENCODING ###
-########################
+################################################### MODEL TRAINING #####################################################
+
+###############
+### IMPORTS ###
+###############
 
 from sklearn.preprocessing import MultiLabelBinarizer
+
+#############################
+### MULTI LABEL BINARIZER ###
+#############################
 
 # Initialize the binarizer
 mlb = MultiLabelBinarizer()
@@ -315,13 +320,10 @@ analysis_df = pd.concat([grouped_income_APL[['income', 'track_age_days']], tags_
 ### FILTERING OUT OUTLIERS ###
 ##############################
 
-# Definiujemy dolny próg (np. $1)
 lower_threshold = 1.00
-
-# Obliczamy górny próg (99. percentyl)
 upper_threshold = analysis_df['income'].quantile(0.99)
 
-print(f"Zakres analizy: od ${lower_threshold:.2f} do ${upper_threshold:.2f}")
+print(f"Zakres analizy: od {lower_threshold:.2f} do {upper_threshold:.2f} Euro")
 
 df_clean = analysis_df[
     (analysis_df['income'] >= lower_threshold) &
@@ -331,7 +333,7 @@ df_clean = analysis_df[
 removed_low = len(analysis_df[analysis_df['income'] < lower_threshold])
 removed_high = len(analysis_df[analysis_df['income'] > upper_threshold])
 
-print(f"Usunięto {removed_low} utworów poniżej progu $1 (tzw. 'dust').")
+print(f"Usunięto {removed_low} utworów poniżej progu 1 Euro (tzw. 'dust').")
 print(f"Usunięto {removed_high} utworów powyżej 99. percentyla (outliery).")
 print(f"Pozostało do analizy: {len(df_clean)} utworów.")
 
@@ -371,7 +373,7 @@ print('\nMEAN INCOME BY TAG:\n', mean_income_by_tag.head(20))
 
 from scipy.stats import pointbiserialr
 
-p_keyword = 'Neutral'
+p_keyword = 'News'
 
 # Check a specific tag
 tag_column = df_clean[p_keyword]
@@ -472,11 +474,9 @@ print(important_tags.head(15))
 # Pipeline automatycznie zeskaluje X_test przed predykcją!
 y_pred = lasso_pipeline.predict(X_test)
 
-print('\nWspółczynnik R^2 (Lasso Pipeline):', r2_score(y_test_log, y_pred))
-
-###################
-### ELASTIC NET ###
-###################
+######################################################
+### ELASTIC NET WITH COLUMN TRANSFORMER & PIPELINE ###
+######################################################
 
 from sklearn.linear_model import ElasticNetCV
 
@@ -523,7 +523,6 @@ print(important_tags_en.head(15))
 y_en_pred = en_pipeline.predict(X_en_test)
 
 print(f'Best L1 Ratio: {en_model.l1_ratio_}') # 1.0 means it behaved like Lasso
-print('\nWspółczynnik R^2 (Elastic Net Pipeline):', r2_score(y_en_test_log, y_en_pred))
 
 #############################
 ### BUSINESS IMPACT TABLE ###
@@ -563,6 +562,39 @@ comparison_table = comparison_table.sort_values(by='Mean_Impact', ascending=Fals
 # }))
 
 # comparison_table.to_csv('business_impact_table.csv')
+
+###############################
+### RANDOM FOREST REGRESSOR ###
+###############################
+
+from sklearn.ensemble import RandomForestRegressor
+
+X_forest = df_clean[list(normal_tags) + ['track_age_days']]
+y_forest = df_clean['income']
+
+# Log transform dla dochodu (nadal zalecany, by wyrównać rozkład)
+y_forest_log = np.log1p(y_forest)
+
+X_forest_train, X_forest_test, y_forest_train, y_forest_test = train_test_split(
+    X_forest, y_forest_log, test_size=0.2, random_state=42)
+
+rf = RandomForestRegressor(n_estimators=500, max_depth=None, min_samples_leaf=5, random_state=42, n_jobs=-1)
+
+rf.fit(X_forest_train, y_forest_train)
+
+y_forest_pred = rf.predict(X_forest_test)
+
+# Feature Importance
+# To odpowiednik 'coefficients' z Lasso, ale pokazuje realny wpływ na decyzje modelu
+importances = pd.Series(rf.feature_importances_, index=X.columns)
+important_features = importances.sort_values(ascending=False)
+
+print('\nTOP 15 NAJWAŻNIEJSZYCH TAGÓW (RF):')
+print(important_features.head(15))
+
+print(f'\nWspółczynnik R^2 (Lasso Pipeline): {r2_score(y_test_log, y_pred):.4f}')
+print(f'\nWspółczynnik R^2 (Elastic Net Pipeline): {r2_score(y_en_test_log, y_en_pred):.4f}')
+print(f'\nWspółczynnik R^2 (Random Forest): {r2_score(y_forest_test, y_forest_pred):.4f}')
 
 ######################
 ### VISUALIZATIONS ###
@@ -632,43 +664,9 @@ axs[1,1].axvline(0, color='black', linewidth=1.5, alpha=0.7)
 axs[1,1].grid(axis='x', linestyle='--', alpha=0.4)
 
 plt.tight_layout()
-# plt.show()
-plt.savefig('Subplots.png')
+plt.show()
+# plt.savefig('Subplots.png')
 
-###############################
-### RANDOM FOREST REGRESSOR ###
-###############################
-
-from sklearn.ensemble import RandomForestRegressor
-
-X_forest = df_clean[list(normal_tags) + ['track_age_days']]
-y_forest = df_clean['income']
-
-# Log transform dla dochodu (nadal zalecany, by wyrównać rozkład)
-y_forest_log = np.log1p(y_forest)
-
-X_forest_train, X_forest_test, y_forest_train, y_forest_test = train_test_split(
-    X_forest, y_forest_log, test_size=0.2, random_state=42)
-
-rf = RandomForestRegressor(n_estimators=500, max_depth=None, min_samples_leaf=5, random_state=42, n_jobs=-1)
-
-rf.fit(X_forest_train, y_forest_train)
-
-y_forest_pred = rf.predict(X_forest_test)
-r2 = r2_score(y_forest_test, y_forest_pred)
-
-print(f'\nWspółczynnik R^2 (Random Forest): {r2:.4f}')
-
-# Feature Importance
-# To odpowiednik 'coefficients' z Lasso, ale pokazuje realny wpływ na decyzje modelu
-importances = pd.Series(rf.feature_importances_, index=X.columns)
-important_features = importances.sort_values(ascending=False)
-
-print('\nTOP 15 NAJWAŻNIEJSZYCH TAGÓW (RF):')
-print(important_features.head(15))
-
-# Pipeline dla Lasso
-# ColumnTransformer
 # Cross Validation Score
 # SHAP dla Random Forest
 # XGBoost
